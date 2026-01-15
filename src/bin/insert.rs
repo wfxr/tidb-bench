@@ -6,6 +6,10 @@ use mysql_async::{Conn, Opts, OptsBuilder, Transaction, TxOpts};
 use rlt::{bench_cli, bench_cli_run, BenchSuite, IterInfo, IterReport, Status};
 use tokio::time::Instant;
 
+// Approximate byte sizes for calculating throughput
+const AVG_STRING_DATA_SIZE: u64 = 50; // Average size of 'bench_data_NNNNN' string
+const INT_VALUE_SIZE: u64 = 4;        // Size of INT column
+
 #[derive(Debug, Clone, clap::ValueEnum)]
 pub enum TxMode {
     /// Auto-commit mode (no explicit transaction)
@@ -104,11 +108,12 @@ impl BenchSuite for InsertBench {
         _info: &IterInfo,
     ) -> Result<IterReport> {
         let t = Instant::now();
-        let mut bytes = 0u64;
+        let bytes: u64;
 
         match self.tx_mode {
             TxMode::AutoCommit => {
                 // Auto-commit: batch insert without explicit transaction
+                // Note: Values are programmatically generated, not from user input
                 let mut values = Vec::new();
                 for i in 0..self.batch_size {
                     let counter = state.insert_counter + i as u64;
@@ -128,12 +133,13 @@ impl BenchSuite for InsertBench {
                 state.conn.query_drop(&query).await?;
                 
                 // Approximate bytes: data string + int + overhead
-                bytes = (self.batch_size as u64) * (50 + 4);
+                bytes = (self.batch_size as u64) * (AVG_STRING_DATA_SIZE + INT_VALUE_SIZE);
             }
             TxMode::Optimistic => {
                 // Optimistic transaction
                 let mut tx: Transaction<'_> = state.conn.start_transaction(TxOpts::default()).await?;
                 
+                // Note: Values are programmatically generated, not from user input
                 let mut values = Vec::new();
                 for i in 0..self.batch_size {
                     let counter = state.insert_counter + i as u64;
@@ -153,7 +159,7 @@ impl BenchSuite for InsertBench {
                 tx.query_drop(&query).await?;
                 tx.commit().await?;
                 
-                bytes = (self.batch_size as u64) * (50 + 4);
+                bytes = (self.batch_size as u64) * (AVG_STRING_DATA_SIZE + INT_VALUE_SIZE);
             }
             TxMode::Pessimistic => {
                 // Pessimistic transaction: use tidb_txn_mode session variable
@@ -164,6 +170,7 @@ impl BenchSuite for InsertBench {
                 
                 let mut tx: Transaction<'_> = state.conn.start_transaction(TxOpts::default()).await?;
                 
+                // Note: Values are programmatically generated, not from user input
                 let mut values = Vec::new();
                 for i in 0..self.batch_size {
                     let counter = state.insert_counter + i as u64;
@@ -189,7 +196,7 @@ impl BenchSuite for InsertBench {
                     .query_drop("SET SESSION tidb_txn_mode = 'optimistic'")
                     .await?;
                 
-                bytes = (self.batch_size as u64) * (50 + 4);
+                bytes = (self.batch_size as u64) * (AVG_STRING_DATA_SIZE + INT_VALUE_SIZE);
             }
         }
 
