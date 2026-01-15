@@ -6,6 +6,10 @@ use mysql_async::{Conn, Opts, OptsBuilder, Transaction, TxOpts};
 use rlt::{bench_cli, bench_cli_run, BenchSuite, IterInfo, IterReport, Status};
 use tokio::time::Instant;
 
+// Configuration constants
+const TEST_DATA_MULTIPLIER: u32 = 2; // Insert 2x more rows than we'll select
+const BIGINT_SIZE: u64 = 8;          // Size of BIGINT column in bytes
+
 #[derive(Debug, Clone, clap::ValueEnum)]
 pub enum TxMode {
     /// Auto-commit mode (no explicit transaction)
@@ -82,8 +86,8 @@ impl BenchSuite for SelectBench {
         ))
         .await?;
 
-        // Insert test data
-        let insert_count = self.select_count * 2; // Insert more than we'll select
+        // Insert test data (insert more than we'll select to ensure enough data)
+        let insert_count = self.select_count * TEST_DATA_MULTIPLIER;
         conn.exec_drop(
             format!(
                 "INSERT INTO {} (data) 
@@ -122,7 +126,7 @@ impl BenchSuite for SelectBench {
                 
                 // Calculate approximate bytes
                 for (_, data) in &result {
-                    bytes += 8 + data.len() as u64; // 8 bytes for id + string length
+                    bytes += BIGINT_SIZE + data.len() as u64;
                 }
             }
             TxMode::Optimistic => {
@@ -138,7 +142,7 @@ impl BenchSuite for SelectBench {
                 
                 // Calculate approximate bytes
                 for (_, data) in &result {
-                    bytes += 8 + data.len() as u64;
+                    bytes += BIGINT_SIZE + data.len() as u64;
                 }
                 
                 tx.commit().await?;
@@ -159,7 +163,7 @@ impl BenchSuite for SelectBench {
                 
                 // Calculate approximate bytes
                 for (_, data) in &result {
-                    bytes += 8 + data.len() as u64;
+                    bytes += BIGINT_SIZE + data.len() as u64;
                 }
                 
                 tx.commit().await?;
