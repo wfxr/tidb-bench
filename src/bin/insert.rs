@@ -1,227 +1,124 @@
+use std::sync::Arc;
+
 use anyhow::Result;
 use async_trait::async_trait;
 use clap::Parser;
 use mysql_async::prelude::*;
-use mysql_async::{Conn, Opts, OptsBuilder, Transaction, TxOpts};
-use rlt::{bench_cli, bench_cli_run, BenchSuite, IterInfo, IterReport, Status};
+use mysql_async::{Conn, TxOpts};
+use rlt::{BenchSuite, IterInfo, IterReport, Status};
+use tidb_bench::{DbOpts, TxMode};
+use tokio::sync::Barrier;
 use tokio::time::Instant;
 
-// Approximate byte sizes for calculating throughput
-const AVG_STRING_DATA_SIZE: u64 = 50; // Average size of 'bench_data_NNNNN' string
-const INT_VALUE_SIZE: u64 = 4;        // Size of INT column
+const AVG_ROW_SIZE: u64 = 54; // ~50 bytes string + 4 bytes int
 
-#[derive(Debug, Clone, clap::ValueEnum)]
-pub enum TxMode {
-    /// Auto-commit mode (no explicit transaction)
-    AutoCommit,
-    /// Optimistic transaction
-    Optimistic,
-    /// Pessimistic transaction
-    Pessimistic,
+/// TiDB INSERT benchmark.
+#[derive(Parser, Clone)]
+struct InsertCli {
+    #[command(flatten)]
+    db: DbOpts,
+
+    /// Number of rows to insert per batch.
+    #[clap(long, short = 'b', default_value_t = 100)]
+    batch_size: u32,
+
+    #[command(flatten)]
+    bench_opts: rlt::cli::BenchCli,
 }
 
-bench_cli!(InsertBench, {
-    /// Host of the TiDB server.
-    #[clap(long, default_value = "localhost")]
-    pub host: String,
+#[derive(Clone)]
+struct InsertBench {
+    db: DbOpts,
+    batch_size: u32,
+    barrier: Arc<Barrier>,
+}
 
-    /// Port of the TiDB server.
-    #[clap(long, default_value_t = 3306)]
-    pub port: u16,
+impl InsertBench {
+    fn from_cli(cli: &InsertCli) -> Self {
+        Self {
+            db: cli.db.clone(),
+            batch_size: cli.batch_size,
+            barrier: Arc::new(Barrier::new(cli.bench_opts.concurrency.get() as usize)),
+        }
+    }
 
-    /// Username for authentication.
-    #[clap(long, default_value = "root")]
-    pub user: String,
-
-    /// Password for authentication.
-    #[clap(long, default_value = "")]
-    pub password: String,
-
-    /// Database name.
-    #[clap(long, default_value = "test")]
-    pub database: String,
-
-    /// Name of the table to insert into.
-    #[clap(long, default_value = "bench_table")]
-    pub table: String,
-
-    /// Number of rows to insert in each batch.
-    #[clap(long, short = 'b', default_value_t = 100)]
-    pub batch_size: u32,
-
-    /// Transaction mode: auto-commit, optimistic, or pessimistic
-    #[clap(long, short = 'm', value_enum, default_value = "auto-commit")]
-    pub tx_mode: TxMode,
-});
-
-pub struct WorkerState {
-    conn: Conn,
-    insert_counter: u64,
+    fn build_batch_values(&self, counter: u64) -> String {
+        (0..self.batch_size)
+            .map(|i| {
+                let c = counter + i as u64;
+                format!("('bench_data_{c}', {})", c % 1000)
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
 }
 
 #[async_trait]
 impl BenchSuite for InsertBench {
-    type WorkerState = WorkerState;
+    type WorkerState = Conn;
 
-    async fn state(&self, _worker_id: u32) -> Result<Self::WorkerState> {
-        let opts = OptsBuilder::default()
-            .ip_or_hostname(&self.host)
-            .tcp_port(self.port)
-            .user(Some(&self.user))
-            .pass(Some(&self.password))
-            .db_name(Some(&self.database));
+    async fn setup(&mut self, worker_id: u32) -> Result<Self::WorkerState> {
+        let mut conn = self.db.connect().await?;
+        self.db.init_tx_mode(&mut conn).await?;
 
-        let conn = Conn::new(Opts::from(opts)).await?;
-        Ok(WorkerState {
-            conn,
-            insert_counter: 0,
-        })
-    }
-
-    async fn setup(&mut self, state: &mut Self::WorkerState, _worker_id: u32) -> Result<()> {
-        // Drop table if exists (idempotent)
-        state
-            .conn
-            .query_drop(format!("DROP TABLE IF EXISTS {}", self.table))
-            .await?;
-
-        // Create table
-        state
-            .conn
-            .query_drop(format!(
-                "CREATE TABLE {} (
+        if worker_id == 0 {
+            let table = self.db.quoted_table();
+            conn.query_drop(format!("DROP TABLE IF EXISTS {table}"))
+                .await?;
+            conn.query_drop(format!(
+                "CREATE TABLE {table} (
                     id BIGINT PRIMARY KEY AUTO_INCREMENT,
                     data VARCHAR(255),
                     value INT,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )",
-                self.table
+                )"
             ))
             .await?;
+        }
 
-        Ok(())
+        self.barrier.wait().await;
+        Ok(conn)
     }
 
-    async fn bench(
-        &mut self,
-        state: &mut Self::WorkerState,
-        _info: &IterInfo,
-    ) -> Result<IterReport> {
+    async fn bench(&mut self, conn: &mut Conn, info: &IterInfo) -> Result<IterReport> {
         let t = Instant::now();
-        let bytes: u64;
+        let counter = info.worker_seq * self.batch_size as u64;
+        let table = self.db.quoted_table();
+        let values = self.build_batch_values(counter);
+        let query = format!("INSERT INTO {table} (data, value) VALUES {values}");
 
-        match self.tx_mode {
+        match self.db.tx_mode {
             TxMode::AutoCommit => {
-                // Auto-commit: batch insert without explicit transaction
-                // Note: Values are programmatically generated, not from user input
-                let mut values = Vec::new();
-                for i in 0..self.batch_size {
-                    let counter = state.insert_counter + i as u64;
-                    values.push(format!(
-                        "('bench_data_{}', {})",
-                        counter,
-                        counter % 1000
-                    ));
-                }
-                
-                let query = format!(
-                    "INSERT INTO {} (data, value) VALUES {}",
-                    self.table,
-                    values.join(", ")
-                );
-                
-                state.conn.query_drop(&query).await?;
-                
-                // Approximate bytes: data string + int + overhead
-                bytes = (self.batch_size as u64) * (AVG_STRING_DATA_SIZE + INT_VALUE_SIZE);
+                conn.query_drop(&query).await?;
             }
-            TxMode::Optimistic => {
-                // Optimistic transaction
-                let mut tx: Transaction<'_> = state.conn.start_transaction(TxOpts::default()).await?;
-                
-                // Note: Values are programmatically generated, not from user input
-                let mut values = Vec::new();
-                for i in 0..self.batch_size {
-                    let counter = state.insert_counter + i as u64;
-                    values.push(format!(
-                        "('bench_data_{}', {})",
-                        counter,
-                        counter % 1000
-                    ));
-                }
-                
-                let query = format!(
-                    "INSERT INTO {} (data, value) VALUES {}",
-                    self.table,
-                    values.join(", ")
-                );
-                
+            TxMode::Optimistic | TxMode::Pessimistic => {
+                let mut tx = conn.start_transaction(TxOpts::default()).await?;
                 tx.query_drop(&query).await?;
                 tx.commit().await?;
-                
-                bytes = (self.batch_size as u64) * (AVG_STRING_DATA_SIZE + INT_VALUE_SIZE);
-            }
-            TxMode::Pessimistic => {
-                // Pessimistic transaction: use tidb_txn_mode session variable
-                state
-                    .conn
-                    .query_drop("SET SESSION tidb_txn_mode = 'pessimistic'")
-                    .await?;
-                
-                let mut tx: Transaction<'_> = state.conn.start_transaction(TxOpts::default()).await?;
-                
-                // Note: Values are programmatically generated, not from user input
-                let mut values = Vec::new();
-                for i in 0..self.batch_size {
-                    let counter = state.insert_counter + i as u64;
-                    values.push(format!(
-                        "('bench_data_{}', {})",
-                        counter,
-                        counter % 1000
-                    ));
-                }
-                
-                let query = format!(
-                    "INSERT INTO {} (data, value) VALUES {}",
-                    self.table,
-                    values.join(", ")
-                );
-                
-                tx.query_drop(&query).await?;
-                tx.commit().await?;
-                
-                // Reset to default
-                state
-                    .conn
-                    .query_drop("SET SESSION tidb_txn_mode = 'optimistic'")
-                    .await?;
-                
-                bytes = (self.batch_size as u64) * (AVG_STRING_DATA_SIZE + INT_VALUE_SIZE);
             }
         }
 
-        state.insert_counter += self.batch_size as u64;
-        let duration = t.elapsed();
-
         Ok(IterReport {
-            duration,
+            duration: t.elapsed(),
             status: Status::success(0),
-            bytes,
+            bytes: self.batch_size as u64 * AVG_ROW_SIZE,
             items: self.batch_size as u64,
         })
     }
 
-    async fn teardown(self, mut state: Self::WorkerState, _info: IterInfo) -> Result<()> {
-        // Clean up: drop the test table
-        state
-            .conn
-            .query_drop(format!("DROP TABLE IF EXISTS {}", self.table))
-            .await?;
+    async fn teardown(self, mut conn: Conn, info: IterInfo) -> Result<()> {
+        if info.worker_id == 0 {
+            conn.query_drop(format!("DROP TABLE IF EXISTS {}", self.db.quoted_table()))
+                .await?;
+        }
         Ok(())
     }
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    bench_cli_run!(InsertBench).await
+    let cli = InsertCli::parse();
+    let bench = InsertBench::from_cli(&cli);
+    rlt::cli::run(cli.bench_opts, bench).await?;
+    Ok(())
 }
