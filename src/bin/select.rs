@@ -1,198 +1,144 @@
+use std::sync::Arc;
+
 use anyhow::Result;
 use async_trait::async_trait;
 use clap::Parser;
 use mysql_async::prelude::*;
-use mysql_async::{Conn, Opts, OptsBuilder, Transaction, TxOpts};
-use rlt::{bench_cli, bench_cli_run, BenchSuite, IterInfo, IterReport, Status};
+use mysql_async::{Conn, TxOpts};
+use rand::Rng;
+use rlt::{BenchSuite, IterInfo, IterReport, Status};
+use tidb_bench::{DbOpts, TxMode};
+use tokio::sync::Barrier;
 use tokio::time::Instant;
 
-// Configuration constants
-const TEST_DATA_MULTIPLIER: u32 = 2; // Insert 2x more rows than we'll select
-const BIGINT_SIZE: u64 = 8;          // Size of BIGINT column in bytes
+const BIGINT_SIZE: u64 = 8;
+const TEST_DATA_MULTIPLIER: u32 = 2;
+const INSERT_BATCH_SIZE: u32 = 5000;
 
-#[derive(Debug, Clone, clap::ValueEnum)]
-pub enum TxMode {
-    /// Auto-commit mode (no explicit transaction)
-    AutoCommit,
-    /// Optimistic transaction
-    Optimistic,
-    /// Pessimistic transaction
-    Pessimistic,
+/// TiDB SELECT benchmark.
+#[derive(Parser, Clone)]
+struct SelectCli {
+    #[command(flatten)]
+    db: DbOpts,
+
+    /// Number of rows to select per query.
+    #[clap(long, default_value_t = 1000)]
+    select_count: u32,
+
+    #[command(flatten)]
+    bench_opts: rlt::cli::BenchCli,
 }
 
-bench_cli!(SelectBench, {
-    /// Host of the TiDB server.
-    #[clap(long, default_value = "localhost")]
-    pub host: String,
+#[derive(Clone)]
+struct SelectBench {
+    db: DbOpts,
+    select_count: u32,
+    total_rows: u32,
+    barrier: Arc<Barrier>,
+}
 
-    /// Port of the TiDB server.
-    #[clap(long, default_value_t = 3306)]
-    pub port: u16,
+impl SelectBench {
+    fn from_cli(cli: &SelectCli) -> Self {
+        Self {
+            db: cli.db.clone(),
+            select_count: cli.select_count,
+            total_rows: cli.select_count * TEST_DATA_MULTIPLIER,
+            barrier: Arc::new(Barrier::new(cli.bench_opts.concurrency.get() as usize)),
+        }
+    }
 
-    /// Username for authentication.
-    #[clap(long, default_value = "root")]
-    pub user: String,
+    /// Insert test rows in batches.
+    async fn insert_test_data(&self, conn: &mut Conn) -> Result<()> {
+        let table = self.db.quoted_table();
+        for start in (0..self.total_rows).step_by(INSERT_BATCH_SIZE as usize) {
+            let end = (start + INSERT_BATCH_SIZE).min(self.total_rows);
+            let values = (start..end)
+                .map(|i| format!("('test_data_{i}')"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            conn.query_drop(format!("INSERT INTO {table} (data) VALUES {values}"))
+                .await?;
+        }
+        Ok(())
+    }
 
-    /// Password for authentication.
-    #[clap(long, default_value = "")]
-    pub password: String,
-
-    /// Database name.
-    #[clap(long, default_value = "test")]
-    pub database: String,
-
-    /// Name of the table to select from.
-    #[clap(long, default_value = "bench_table")]
-    pub table: String,
-
-    /// Number of rows to select in each iteration.
-    #[clap(long, default_value_t = 1000)]
-    pub select_count: u32,
-
-    /// Transaction mode: auto-commit, optimistic, or pessimistic
-    #[clap(long, short = 'm', value_enum, default_value = "auto-commit")]
-    pub tx_mode: TxMode,
-});
+    fn max_offset(&self) -> u32 {
+        self.total_rows.saturating_sub(self.select_count)
+    }
+}
 
 #[async_trait]
 impl BenchSuite for SelectBench {
     type WorkerState = Conn;
 
-    async fn state(&self, _worker_id: u32) -> Result<Self::WorkerState> {
-        let opts = OptsBuilder::default()
-            .ip_or_hostname(&self.host)
-            .tcp_port(self.port)
-            .user(Some(&self.user))
-            .pass(Some(&self.password))
-            .db_name(Some(&self.database));
+    async fn setup(&mut self, worker_id: u32) -> Result<Self::WorkerState> {
+        let mut conn = self.db.connect().await?;
+        self.db.init_tx_mode(&mut conn).await?;
 
-        let conn = Conn::new(Opts::from(opts)).await?;
+        if worker_id == 0 {
+            let table = self.db.quoted_table();
+            conn.query_drop(format!("DROP TABLE IF EXISTS {table}"))
+                .await?;
+            conn.query_drop(format!(
+                "CREATE TABLE {table} (
+                    id BIGINT PRIMARY KEY AUTO_INCREMENT,
+                    data VARCHAR(255),
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )"
+            ))
+            .await?;
+            self.insert_test_data(&mut conn).await?;
+        }
+
+        self.barrier.wait().await;
         Ok(conn)
     }
 
-    async fn setup(&mut self, conn: &mut Self::WorkerState, _worker_id: u32) -> Result<()> {
-        // Drop table if exists (idempotent)
-        conn.query_drop(format!("DROP TABLE IF EXISTS {}", self.table))
-            .await?;
-
-        // Create table
-        conn.query_drop(format!(
-            "CREATE TABLE {} (
-                id BIGINT PRIMARY KEY AUTO_INCREMENT,
-                data VARCHAR(255),
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )",
-            self.table
-        ))
-        .await?;
-
-        // Insert test data (insert more than we'll select to ensure enough data)
-        let insert_count = self.select_count * TEST_DATA_MULTIPLIER;
-        conn.exec_drop(
-            format!(
-                "INSERT INTO {} (data) 
-                 SELECT CONCAT('test_data_', n) 
-                 FROM (
-                   SELECT @row := @row + 1 as n 
-                   FROM (SELECT 0 UNION ALL SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT 3 UNION ALL SELECT 4 UNION ALL SELECT 5 UNION ALL SELECT 6 UNION ALL SELECT 7 UNION ALL SELECT 8 UNION ALL SELECT 9) t1,
-                        (SELECT 0 UNION ALL SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT 3 UNION ALL SELECT 4 UNION ALL SELECT 5 UNION ALL SELECT 6 UNION ALL SELECT 7 UNION ALL SELECT 8 UNION ALL SELECT 9) t2,
-                        (SELECT 0 UNION ALL SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT 3 UNION ALL SELECT 4 UNION ALL SELECT 5 UNION ALL SELECT 6 UNION ALL SELECT 7 UNION ALL SELECT 8 UNION ALL SELECT 9) t3,
-                        (SELECT 0 UNION ALL SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT 3 UNION ALL SELECT 4 UNION ALL SELECT 5 UNION ALL SELECT 6 UNION ALL SELECT 7 UNION ALL SELECT 8 UNION ALL SELECT 9) t4,
-                        (SELECT @row := 0) r
-                 ) nums 
-                 WHERE n <= ?",
-                self.table
-            ),
-            (insert_count,),
-        )
-        .await?;
-
-        Ok(())
-    }
-
-    async fn bench(&mut self, conn: &mut Self::WorkerState, _info: &IterInfo) -> Result<IterReport> {
+    async fn bench(&mut self, conn: &mut Conn, _info: &IterInfo) -> Result<IterReport> {
         let t = Instant::now();
-        let mut bytes = 0u64;
+        let table = self.db.quoted_table();
+        let offset = rand::thread_rng().gen_range(0..=self.max_offset());
+        let query = format!(
+            "SELECT id, data FROM {table} LIMIT {} OFFSET {offset}",
+            self.select_count
+        );
 
-        match self.tx_mode {
-            TxMode::AutoCommit => {
-                // Auto-commit: just run the query directly
-                let result: Vec<(i64, String)> = conn
-                    .exec(
-                        format!("SELECT id, data FROM {} LIMIT ?", self.table),
-                        (self.select_count,),
-                    )
-                    .await?;
-                
-                // Calculate approximate bytes
-                for (_, data) in &result {
-                    bytes += BIGINT_SIZE + data.len() as u64;
-                }
-            }
-            TxMode::Optimistic => {
-                // Optimistic transaction
-                let mut tx: Transaction<'_> = conn.start_transaction(TxOpts::default()).await?;
-                
-                let result: Vec<(i64, String)> = tx
-                    .exec(
-                        format!("SELECT id, data FROM {} LIMIT ?", self.table),
-                        (self.select_count,),
-                    )
-                    .await?;
-                
-                // Calculate approximate bytes
-                for (_, data) in &result {
-                    bytes += BIGINT_SIZE + data.len() as u64;
-                }
-                
+        let result: Vec<(i64, String)> = match self.db.tx_mode {
+            TxMode::AutoCommit => conn.query(&query).await?,
+            TxMode::Optimistic | TxMode::Pessimistic => {
+                let mut tx = conn.start_transaction(TxOpts::default()).await?;
+                let rows = tx.query(&query).await?;
                 tx.commit().await?;
+                rows
             }
-            TxMode::Pessimistic => {
-                // Pessimistic transaction: use tidb_txn_mode session variable
-                conn.query_drop("SET SESSION tidb_txn_mode = 'pessimistic'")
-                    .await?;
-                
-                let mut tx: Transaction<'_> = conn.start_transaction(TxOpts::default()).await?;
-                
-                let result: Vec<(i64, String)> = tx
-                    .exec(
-                        format!("SELECT id, data FROM {} LIMIT ?", self.table),
-                        (self.select_count,),
-                    )
-                    .await?;
-                
-                // Calculate approximate bytes
-                for (_, data) in &result {
-                    bytes += BIGINT_SIZE + data.len() as u64;
-                }
-                
-                tx.commit().await?;
-                
-                // Reset to default
-                conn.query_drop("SET SESSION tidb_txn_mode = 'optimistic'")
-                    .await?;
-            }
-        }
+        };
 
-        let duration = t.elapsed();
+        let bytes: u64 = result
+            .iter()
+            .map(|(_, data)| BIGINT_SIZE + data.len() as u64)
+            .sum();
 
         Ok(IterReport {
-            duration,
+            duration: t.elapsed(),
             status: Status::success(0),
             bytes,
             items: self.select_count as u64,
         })
     }
 
-    async fn teardown(self, mut conn: Self::WorkerState, _info: IterInfo) -> Result<()> {
-        // Clean up: drop the test table
-        conn.query_drop(format!("DROP TABLE IF EXISTS {}", self.table))
-            .await?;
+    async fn teardown(self, mut conn: Conn, info: IterInfo) -> Result<()> {
+        if info.worker_id == 0 {
+            conn.query_drop(format!("DROP TABLE IF EXISTS {}", self.db.quoted_table()))
+                .await?;
+        }
         Ok(())
     }
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    bench_cli_run!(SelectBench).await
+    let cli = SelectCli::parse();
+    let bench = SelectBench::from_cli(&cli);
+    rlt::cli::run(cli.bench_opts, bench).await?;
+    Ok(())
 }
