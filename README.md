@@ -2,6 +2,8 @@
 
 Benchmark tool for TiDB using [rlt](https://github.com/wfxr/rlt).
 
+![screenshot](assets/screenshot.gif)
+
 ## Prerequisites
 
 - Rust toolchain (1.70+)
